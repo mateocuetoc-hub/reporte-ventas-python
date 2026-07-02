@@ -1,23 +1,57 @@
 from pathlib import Path
 import sys
+import argparse
+import unicodedata
+from datetime import datetime
+
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, Reference
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 
-ARCHIVO_ENTRADA = DATA_DIR / "ventas_cliente.xlsx"
-ARCHIVO_SALIDA = OUTPUT_DIR / "reporte_final.xlsx"
+ARCHIVO_ENTRADA_DEFAULT = DATA_DIR / "ventas_cliente.xlsx"
+ARCHIVO_SALIDA_DEFAULT = OUTPUT_DIR / "reporte_final.xlsx"
 
 COLUMNAS_NECESARIAS = ["producto", "cantidad", "precio_unitario"]
 
 
+def normalizar_texto(texto):
+    texto = str(texto).strip().lower()
+    texto = texto.replace(" ", "_")
+    texto = texto.replace("-", "_")
+
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        caracter for caracter in texto
+        if not unicodedata.combining(caracter)
+    )
+
+    return texto
+
+
+def leer_archivo(ruta_entrada, separador_csv):
+    extension = ruta_entrada.suffix.lower()
+
+    if extension in [".xlsx", ".xls"]:
+        return pd.read_excel(ruta_entrada)
+
+    if extension == ".csv":
+        return pd.read_csv(ruta_entrada, sep=separador_csv)
+
+    print("Error: formato de archivo no soportado.")
+    print("Formatos aceptados: .xlsx, .xls, .csv")
+    print(f"Archivo recibido: {ruta_entrada}")
+    sys.exit(1)
+
+
 def validar_archivo(df):
-    df.columns = [str(col).strip().lower() for col in df.columns]
+    df.columns = [normalizar_texto(columna) for columna in df.columns]
 
     columnas_faltantes = []
 
@@ -26,10 +60,19 @@ def validar_archivo(df):
             columnas_faltantes.append(columna)
 
     if len(columnas_faltantes) > 0:
-        print("Error: faltan columnas en el Excel de entrada.")
-        print("Columnas faltantes:")
+        print("Error: faltan columnas en el archivo de entrada.")
+        print("Columnas necesarias:")
+        for columna in COLUMNAS_NECESARIAS:
+            print(f"- {columna}")
+
+        print("\nColumnas faltantes:")
         for columna in columnas_faltantes:
             print(f"- {columna}")
+
+        print("\nColumnas encontradas:")
+        for columna in df.columns:
+            print(f"- {columna}")
+
         sys.exit(1)
 
     if df.empty:
@@ -39,6 +82,10 @@ def validar_archivo(df):
     df["producto"] = df["producto"].astype(str).str.strip()
     df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce")
     df["precio_unitario"] = pd.to_numeric(df["precio_unitario"], errors="coerce")
+
+    if df["producto"].eq("").any():
+        print("Error: hay productos sin nombre.")
+        sys.exit(1)
 
     if df["cantidad"].isnull().any():
         print("Error: hay valores inválidos en la columna 'cantidad'.")
@@ -97,7 +144,14 @@ def formatear_tabla(ws):
     ajustar_columnas(ws)
 
 
-def crear_resumen_ejecutivo(wb, total_vendido, producto_mas_vendido, cantidad_mas_vendida):
+def crear_resumen_ejecutivo(
+    wb,
+    nombre_negocio,
+    fecha_reporte,
+    total_vendido,
+    producto_mas_vendido,
+    cantidad_mas_vendida
+):
     if "Resumen Ejecutivo" in wb.sheetnames:
         del wb["Resumen Ejecutivo"]
 
@@ -106,24 +160,27 @@ def crear_resumen_ejecutivo(wb, total_vendido, producto_mas_vendido, cantidad_ma
     ws["A1"] = "REPORTE DE VENTAS"
     ws["A1"].font = Font(bold=True, size=18, color="1F4E78")
 
-    ws["A3"] = "Total vendido"
-    ws["B3"] = total_vendido
-    ws["B3"].number_format = '$#,##0'
+    ws["A2"] = nombre_negocio
+    ws["A2"].font = Font(bold=True, size=13)
 
-    ws["A4"] = "Producto más vendido"
-    ws["B4"] = producto_mas_vendido
+    ws["A4"] = "Fecha del reporte"
+    ws["B4"] = fecha_reporte
 
-    ws["A5"] = "Cantidad vendida"
-    ws["B5"] = cantidad_mas_vendida
+    ws["A5"] = "Total vendido"
+    ws["B5"] = total_vendido
+    ws["B5"].number_format = '$#,##0'
 
-    for celda in ["A3", "A4", "A5"]:
+    ws["A6"] = "Producto más vendido"
+    ws["B6"] = producto_mas_vendido
+
+    ws["A7"] = "Cantidad vendida"
+    ws["B7"] = cantidad_mas_vendida
+
+    for celda in ["A4", "A5", "A6", "A7"]:
         ws[celda].font = Font(bold=True)
 
-    for celda in ["A3", "A4", "A5", "B3", "B4", "B5"]:
-        ws[celda].alignment = Alignment(horizontal="left")
-
     ws.column_dimensions["A"].width = 25
-    ws.column_dimensions["B"].width = 25
+    ws.column_dimensions["B"].width = 30
 
     ws_resumen = wb["Resumen"]
 
@@ -151,18 +208,65 @@ def crear_resumen_ejecutivo(wb, total_vendido, producto_mas_vendido, cantidad_ma
     grafico.height = 8
     grafico.width = 16
 
-    ws.add_chart(grafico, "D3")
+    ws.add_chart(grafico, "D4")
 
 
-def generar_reporte():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+def crear_hoja_metadatos(
+    wb,
+    nombre_negocio,
+    fecha_reporte,
+    ruta_entrada,
+    ruta_salida,
+    cantidad_registros,
+    total_vendido
+):
+    if "Metadatos" in wb.sheetnames:
+        del wb["Metadatos"]
 
-    if not ARCHIVO_ENTRADA.exists():
+    ws = wb.create_sheet("Metadatos")
+
+    datos = [
+        ["Nombre del negocio", nombre_negocio],
+        ["Fecha del reporte", fecha_reporte],
+        ["Archivo de entrada", str(ruta_entrada)],
+        ["Archivo de salida", str(ruta_salida)],
+        ["Cantidad de registros procesados", cantidad_registros],
+        ["Total vendido", total_vendido],
+        ["Herramienta", "Python + Pandas + OpenPyXL"],
+        ["Versión del proyecto", "4"]
+    ]
+
+    for fila, dato in enumerate(datos, start=1):
+        ws.cell(row=fila, column=1).value = dato[0]
+        ws.cell(row=fila, column=2).value = dato[1]
+
+    for celda in ws["A"]:
+        celda.font = Font(bold=True)
+
+    ws["B6"].number_format = '$#,##0'
+
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 80
+
+
+def generar_reporte(ruta_entrada, ruta_salida, nombre_negocio, separador_csv):
+    ruta_entrada = Path(ruta_entrada)
+    ruta_salida = Path(ruta_salida)
+
+    if not ruta_entrada.is_absolute():
+        ruta_entrada = BASE_DIR / ruta_entrada
+
+    if not ruta_salida.is_absolute():
+        ruta_salida = BASE_DIR / ruta_salida
+
+    ruta_salida.parent.mkdir(parents=True, exist_ok=True)
+
+    if not ruta_entrada.exists():
         print("Error: no se encontró el archivo de entrada.")
-        print(f"Debes tener este archivo: {ARCHIVO_ENTRADA}")
+        print(f"Ruta recibida: {ruta_entrada}")
         sys.exit(1)
 
-    df = pd.read_excel(ARCHIVO_ENTRADA)
+    df = leer_archivo(ruta_entrada, separador_csv)
     df = validar_archivo(df)
 
     df["total"] = df["cantidad"] * df["precio_unitario"]
@@ -171,6 +275,11 @@ def generar_reporte():
         "cantidad": "sum",
         "total": "sum"
     }).reset_index()
+
+    resumen_productos = resumen_productos.sort_values(
+        by="total",
+        ascending=False
+    )
 
     total_vendido = df["total"].sum()
 
@@ -181,35 +290,94 @@ def generar_reporte():
 
     cantidad_mas_vendida = resumen_productos["cantidad"].max()
 
+    fecha_reporte = datetime.now().strftime("%d-%m-%Y %H:%M")
+
     try:
-        with pd.ExcelWriter(ARCHIVO_SALIDA, engine="openpyxl") as writer:
+        with pd.ExcelWriter(ruta_salida, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Ventas", index=False)
             resumen_productos.to_excel(writer, sheet_name="Resumen", index=False)
 
-        wb = load_workbook(ARCHIVO_SALIDA)
+        wb = load_workbook(ruta_salida)
 
         formatear_tabla(wb["Ventas"])
         formatear_tabla(wb["Resumen"])
 
         crear_resumen_ejecutivo(
             wb,
+            nombre_negocio,
+            fecha_reporte,
             total_vendido,
             producto_mas_vendido,
             cantidad_mas_vendida
         )
 
-        wb.save(ARCHIVO_SALIDA)
+        crear_hoja_metadatos(
+            wb,
+            nombre_negocio,
+            fecha_reporte,
+            ruta_entrada,
+            ruta_salida,
+            len(df),
+            total_vendido
+        )
+
+        wb.save(ruta_salida)
 
     except PermissionError:
         print("Error: no se pudo guardar el reporte.")
-        print("Cierra el archivo reporte_final.xlsx si está abierto en LibreOffice.")
+        print("Cierra el archivo de salida si está abierto en LibreOffice.")
         sys.exit(1)
 
     print("Reporte generado correctamente.")
+    print(f"Negocio: {nombre_negocio}")
+    print(f"Fecha: {fecha_reporte}")
+    print(f"Archivo de entrada: {ruta_entrada}")
+    print(f"Archivo creado: {ruta_salida}")
     print(f"Total vendido: ${total_vendido:,.0f}")
     print(f"Producto más vendido: {producto_mas_vendido} ({cantidad_mas_vendida} unidades)")
-    print(f"Archivo creado: {ARCHIVO_SALIDA}")
+
+
+def obtener_argumentos():
+    parser = argparse.ArgumentParser(
+        description="Generador automático de reportes de ventas en Excel."
+    )
+
+    parser.add_argument(
+        "entrada",
+        nargs="?",
+        default=str(ARCHIVO_ENTRADA_DEFAULT),
+        help="Ruta del archivo de entrada. Soporta .xlsx, .xls y .csv."
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=str(ARCHIVO_SALIDA_DEFAULT),
+        help="Ruta del archivo Excel de salida."
+    )
+
+    parser.add_argument(
+        "-n",
+        "--negocio",
+        default="Negocio de ejemplo",
+        help="Nombre del negocio que aparecerá en el reporte."
+    )
+
+    parser.add_argument(
+        "--sep",
+        default=",",
+        help="Separador para archivos CSV. Por defecto usa coma (,)."
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    generar_reporte()
+    args = obtener_argumentos()
+
+    generar_reporte(
+        args.entrada,
+        args.output,
+        args.negocio,
+        args.sep
+    )
